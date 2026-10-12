@@ -66,20 +66,24 @@ agy-hd start -n tên -d /repo -W -C -f task.md      # + mang thay đổi CHƯA c
 agy-hd start -n tên -d /repo -R -p "review X"      # chỉ đọc
 agy-hd start -A ...                                # async: không chờ xong, in ACCESS rồi thoát
 agy-hd watch <job> [<job>...]                      # phụ: chạy nền, báo ngay khi xong/treo/hết hạn mức
-agy-hd tick --show                                 # bảng trạng thái mọi job (systemd timer chạy mỗi phút)
+agy-hd tick --show                                 # bảng trạng thái mọi job (systemd timer chạy mỗi phút); --brief = một dòng
+agy-hd notify <job>...                             # im lặng, chỉ in khi DONE/STOPPED/STALL/BLOCKED/bị chặn do hết quota (chạy bằng Monitor)
 agy-hd restart <job>                               # hết hạn mức: tắt agy rồi mở lại cùng hội thoại + "làm tiếp"
 ```
 
 `-t giây` timeout chờ (900). Cuối lệnh in `STATUS=DONE|BLOCKED|TIMEOUT|ERROR`, diffstat (nếu `-W`),
 rồi `---` và câu trả lời cuối của agy. `<job>` = id (`a-<tên>-xxxx`, cũng là tên agent herdr).
 
-## Scheduler: kiểm mỗi phút (bắt buộc)
+## Scheduler: tick mỗi phút (script) + notify (bắt buộc)
 
 Người dùng yêu cầu ngày 2026-10-05:
 - "cứ 1 phút là phải check lại subagent một lần đối với agy, vì nó có thể treo giữa chừng";
 - sau đó, khi cả 4 agent dừng vì hết hạn mức mà phiên Claude không biết: "tôi thấy subagent đã bị dừng nhưng bạn không biết… hãy viết scheduler… biết được subagent đang chạy, đã từng, đã hết limit, đã done… mỗi phút một lần".
 
-Hôm đó một `agy-hd watch` chạy nền trong phiên đã bị Claude Code dừng vì máy thiếu RAM. Nên **không được chỉ dựa vào watch**. Giám sát có hai lớp:
+Hôm đó một `agy-hd watch` chạy nền trong phiên đã bị Claude Code dừng vì máy thiếu RAM. Nên **không được chỉ dựa vào watch**.
+Yêu cầu "mỗi phút" được thoả bởi lớp 1 (script bash, 0 token). **Đừng biến nó thành "phiên Claude tự poll mỗi phút"**: mỗi lượt
+poll là một lượt LLM đọc lại cả context (cache read), 60 lượt/giờ mà ~99% là "không có gì đổi" (người dùng 2026-10-12: "có tốn token
+của thằng đang quản lý không, có cách nào tối ưu hơn"). Giám sát có ba lớp, token tăng dần theo độ hiếm khi dùng:
 
 **1. systemd timer, chạy mọi lúc, độc lập với phiên Claude.**
 - `agy-hd-tick.timer` (user unit, `~/.config/systemd/user/`) chạy `agy-hd tick` mỗi phút.
@@ -89,11 +93,24 @@ Hôm đó một `agy-hd watch` chạy nền trong phiên đã bị Claude Code d
   - **tự restart job hết hạn mức** (xem mục dưới).
 - Kiểm timer còn chạy: `systemctl --user is-active agy-hd-tick.timer`. Tắt: `systemctl --user disable --now agy-hd-tick.timer`.
 
-**2. Phiên Claude tự đánh thức mỗi phút, trong lúc còn job agy đang chạy.**
-- Ngay sau `start -A` hoặc `fan`, tạo một lịch bằng `CronCreate`, `cron: "* * * * *"`, với prompt kiểu:
-  `agy check-in (#<số> <tên>): chạy agy-hd tick --show, xem các job của nhiệm vụ này và xử lý theo bảng trạng thái của skill agy-subagent. Không có gì đổi thì trả lời một dòng. Khi mọi job DONE thì kiểm chứng kết quả rồi CronDelete lịch này.`
+**2. `agy-hd notify`: báo CHÍNH cho phiên Claude, 0 token khi yên.** Đọc `events.log` do lớp 1 ghi, chỉ in một dòng khi có việc cần
+người xử lý, nên phiên Claude chỉ bị đánh thức đúng lúc đó.
+- Ngay sau `start -A` hoặc `fan`, chạy bằng tool **Monitor** (tải bằng ToolSearch `select:Monitor` nếu chưa có):
+  `agy-hd notify <job>...` (mỗi dòng stdout = một thông báo). Không có Monitor thì Bash `run_in_background: true` với
+  `agy-hd notify -1 <job>...` (thoát sau sự kiện đầu; xử lý xong thì chạy lại).
+- In đúng các dòng này, mỗi dòng kèm việc phải làm:
+  `DONE`, `STOPPED`, `STALL`, `BLOCKED`, và nhóm **bị chặn do hết hạn mức**: `QUOTA_NO_ACCOUNT` (không còn account khác để chuyển),
+  `QUOTA_GAVE_UP` (đã restart `AGY_QUOTA_MAX`=5 lần mà vẫn hết, tick dừng), `RESTART_FAILED`.
+  Không in RUNNING, QUOTA đơn lẻ (tick tự restart và đổi account), auto-restart.
+- Trạng thái đã có sẵn lúc bắt đầu cũng được in một lần, nên không lỡ sự kiện xảy ra trước khi notify chạy.
+- Tự chữa: nếu `STATUS.updated` cũ hơn 150 s (timer chết) thì notify tự chạy tick và in `NOTIFY_WARN` một lần.
+- Thoát 0 với `NOTIFY=ALL_DONE` khi mọi job DONE. Quá `-t` (mặc định 6 giờ) thì thoát 5.
+
+**3. Lịch dự phòng 5 phút bằng `CronCreate`, chỉ để bắt trường hợp lớp 2 bị Claude Code dừng (thiếu RAM như 10-05).**
+- `cron: "*/5 * * * *"`, prompt: `agy check-in (#<số> <tên>): chạy agy-hd tick --brief. Dòng OK thì trả lời đúng một chữ "ok". Có ACTION thì xử lý theo bảng trạng thái của skill agy-subagent. Nếu không còn Monitor notify nào chạy thì bật lại.`
+- `tick --brief` cũng chạy luôn một lượt tick (nên lớp này còn tự chữa cả timer chết) và chỉ in một dòng khi mọi job RUNNING.
 - Lịch chỉ chạy khi phiên rảnh, và tự hết hạn sau 7 ngày.
-- **Xoá lịch (`CronDelete`) khi mọi job của nhiệm vụ đã DONE**, để không đánh thức phiên vô ích.
+- **Xoá lịch (`CronDelete`) khi mọi job của nhiệm vụ đã DONE** (và dừng Monitor), để không đánh thức phiên vô ích.
 
 **Bảng trạng thái** (`agy-hd tick --show`):
 
@@ -101,7 +118,7 @@ Hôm đó một `agy-hd watch` chạy nền trong phiên đã bị Claude Code d
 |---|---|---|
 | `RUNNING` | agy đang làm: working, hoặc còn lệnh đang chạy | không làm gì; nếu muốn thì xem tiến độ (số bước, file đầu ra) |
 | `DONE` | xong: không còn lệnh chạy, transcript kết thúc bằng câu trả lời cuối (kể cả đã park) | kiểm chứng (đọc diff, chạy lại test), rồi **đóng tab ngay**: `agy-hd close <job>` (hoặc `wt-merge`/`wt-drop`) |
-| `QUOTA` | hết hạn mức Antigravity | tick tự `restart`; theo dõi xem lần tick sau có về `RUNNING` không |
+| `QUOTA` | hết hạn mức Antigravity | tick tự `restart` (đổi account nếu còn). Chỉ phải làm gì khi `notify` báo `QUOTA_NO_ACCOUNT` / `QUOTA_GAVE_UP` / `RESTART_FAILED`: báo người dùng kèm giờ "Resets in" (`agy-hd logs <job> 20`), `agy-p usage` xem account nào hồi trước, đừng restart vòng vòng |
 | `STOPPED` | dừng giữa chừng: agy thoát hoặc đứng im mà không có câu trả lời cuối | `agy-hd logs <job> 40`, rồi `agy-hd resume <job>` / `restart <job>` |
 | `STALL` | treo: lệnh chạy quá `AGY_CMD_STALL_SEC` (900 s), hoặc working mà transcript đứng yên quá `AGY_STALL_SEC` (180 s) | xem log; treo thật thì `interrupt` rồi `prompt` tiếp |
 | `BLOCKED` | agy đang hỏi hoặc chờ duyệt | báo người dùng kèm lệnh attach, đừng trả lời thay |
@@ -148,10 +165,11 @@ Người dùng dặn ngày 2026-10-05: "khi done task subagent thì đóng tab l
   2. mở lại đúng hội thoại cũ (`resume`);
   3. gửi prompt "làm tiếp việc dở, xem lại file đã ghi, không làm lại từ đầu".
   Ngày 2026-10-05 cách này cứu được cả 4 agent: chúng chấm tiếp đúng chỗ dở (125 → 249 nhãn) rồi xong.
-- **tick tự làm việc này** cho job ở trạng thái QUOTA: tối đa 5 lần mỗi job, cách nhau ít nhất 3 phút (1 phút nếu job chạy qua agy-p), mỗi lần ghi vào `events.log`.
+- **tick tự làm việc này** cho job ở trạng thái QUOTA: tối đa `AGY_QUOTA_MAX` (5) lần liên tiếp, cách nhau ít nhất 3 phút (1 phút nếu job chạy qua agy-p; `AGY_QUOTA_GAP` ghi đè), mỗi lần ghi vào `events.log` (mọi dòng mang id job).
+  Job chạy lại được `AGY_QUOTA_RESET_SEC` (600 s) mà không dính quota nữa thì bộ đếm về 0, nên job sống 24 giờ gặp quota 5 giờ nhiều lần vẫn được cứu mỗi lần.
   Job chạy qua agy-p thì restart **chuyển sang account khác còn quota** (loại account vừa hết, `QUOTA_EMAILS` trong meta ghi account đó; account khác chỉ bị
   loại khi quota lấy mới dưới 5%, nên account đã hồi quota được chọn lại), rồi
-  resume đúng conversation; không còn account nào thì mở lại trên account cũ. Đã e2e 2026-10-08: account hết quota 5 giờ (0%) → account khác, cùng conversation, xong việc. Sau 5 lần vẫn hết hạn mức thì tick ghi `QUOTA_GAVE_UP`. Lúc đó **báo người dùng**, kèm thời gian "Resets in" trên màn hình, đừng restart vòng vòng.
+  resume đúng conversation; không còn account nào thì ghi `QUOTA_NO_ACCOUNT` rồi mở lại trên account cũ. Đã e2e 2026-10-08: account hết quota 5 giờ (0%) → account khác, cùng conversation, xong việc. Sau `AGY_QUOTA_MAX` lần vẫn hết hạn mức thì tick ghi `QUOTA_GAVE_UP` (và `notify` in ra). Lúc đó **báo người dùng**, kèm thời gian "Resets in" trên màn hình, đừng restart vòng vòng.
 - Việc có file đầu ra ghi dần (ví dụ labels.jsonl) nên được thiết kế để làm tiếp được: ghi theo lô, có script kiểm tra. Sau khi job DONE, kiểm lại số dòng hoặc chạy script kiểm tra.
 
 ## Viết prompt
@@ -167,7 +185,7 @@ Script tự nối ràng buộc cứng (không push/commit/reset, không mạng 1
 |---|---|
 | Gửi prompt tiếp (cùng agent, nhớ ngữ cảnh) | `agy-hd prompt <job> "..."` (`-f file`, `-A` không chờ) |
 | Trạng thái + màn hình cuối | `agy-hd status <job>` (idle/working/blocked/done/gone, STALL) |
-| **Giám sát mỗi phút, báo khi xong/treo** | `agy-hd watch <job>...` (chạy nền; xem mục Giám sát) |
+| **Báo khi xong/treo/hết hạn mức (0 token khi yên)** | `agy-hd notify <job>...` bằng Monitor (mục Scheduler); `watch` chỉ còn là lớp phụ |
 | Chờ xong lượt hiện tại | `agy-hd wait <job> 600` |
 | Log live / lịch sử đầy đủ | `agy-hd logs <job> 80` / `agy-hd logs <job> 50 --transcript` |
 | Câu trả lời cuối / + diffstat | `agy-hd result <job>` / `agy-hd summary <job>` |
@@ -211,10 +229,11 @@ Song song nhiều task: [agy-parallel](../agy-parallel/SKILL.md).
 1. Plan, chia việc. Việc mơ hồ/rủi ro cao thì tự làm.
 2. `start -A`, rồi:
    - **đưa ACCESS cho người dùng ngay**;
-   - **tạo lịch `CronCreate` mỗi phút** để phiên tự đánh thức và đọc `agy-hd tick --show` (mục Scheduler);
+   - **bật `agy-hd notify <job>...` bằng tool Monitor** (0 token khi yên; mục Scheduler lớp 2);
+   - **tạo lịch dự phòng `CronCreate */5`** chạy `agy-hd tick --brief` (mục Scheduler lớp 3), KHÔNG tạo lịch mỗi phút;
    - kiểm `systemctl --user is-active agy-hd-tick.timer`.
-   Làm việc khác trong lúc chờ. Mỗi lần được đánh thức thì xử lý theo bảng trạng thái, không đoán. Mỗi job DONE
-   thì kiểm chứng rồi **đóng tab** (`agy-hd close <job>`). Mọi job DONE thì `CronDelete`.
+   Làm việc khác trong lúc chờ. Mỗi lần được đánh thức (dòng `NOTIFY` hoặc lịch dự phòng) thì xử lý theo bảng trạng thái, không đoán. Mỗi job DONE
+   thì kiểm chứng rồi **đóng tab** (`agy-hd close <job>`). Mọi job DONE thì `CronDelete` và dừng Monitor.
 3. **Không tin báo cáo của agy.** Đọc `wt-diff`/`git diff`, chạy lại test, đối chiếu file bị sửa với phạm vi
    đã giao; ngoài phạm vi thì không merge. agy bypass quyền nên có thể đọc/sửa ngoài phạm vi.
 4. Sai: `agy-hd prompt <job> "Sửa: …"` (cùng ngữ cảnh), tối đa 2 vòng, rồi tự sửa.

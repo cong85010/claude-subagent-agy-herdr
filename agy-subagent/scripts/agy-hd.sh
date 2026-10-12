@@ -24,6 +24,9 @@
 #   agy-hd wait <job> [giây] chờ agent xong lượt hiện tại
 #   agy-hd watch [-i 60] [-t 3600] <job>...  KIỂM MỖI PHÚT, thoát ngay khi DONE / BLOCKED / GONE / STALL (treo).
 #       Luôn chạy nền sau start -A / fan để phiên Claude được báo khi agy xong hoặc treo giữa chừng
+#   agy-hd notify [-t 21600] [-1] <job>...  LỚP BÁO CHÍNH: im lặng, chỉ in một dòng khi job DONE/STOPPED/STALL/BLOCKED hoặc
+#       bị chặn do hết hạn mức (QUOTA_NO_ACCOUNT, QUOTA_GAVE_UP, RESTART_FAILED). Đọc events.log do tick ghi. Chạy bằng tool
+#       Monitor (0 token khi yên); -1 thoát sau sự kiện đầu (cho Bash run_in_background). Thoát 0 khi mọi job DONE
 #   agy-hd logs <job> [n=80] [--transcript]   màn hình live, hoặc transcript đầy đủ của agy
 #   agy-hd result <job>      câu trả lời cuối của agy (từ transcript)
 #   agy-hd summary <job>     result + diffstat worktree
@@ -35,7 +38,7 @@
 #                            profile = account khác còn nhiều quota nhất; -f: job đang chạy thì interrupt trước
 #   agy-hd accounts          các account agy-p: quota Gemini + job đang mở trên từng account
 #   agy-hd restart <job> ["prompt"]  HẾT HẠN MỨC (quota): tắt agy của job rồi mở lại cùng hội thoại + prompt "làm tiếp"
-#   agy-hd tick [--show]     SCHEDULER: một lượt kiểm MỌI job đang mở (RUNNING/DONE/QUOTA/STOPPED/STALL/BLOCKED), ghi
+#   agy-hd tick [--show|--brief]  SCHEDULER: một lượt kiểm MỌI job đang mở (RUNNING/DONE/QUOTA/STOPPED/STALL/BLOCKED), ghi
 #                            STATUS.tsv + events.log, tự restart job hết hạn mức. systemd timer agy-hd-tick chạy mỗi phút
 #   agy-hd close <job>       đóng workspace (kill mọi thứ trong đó)
 #   agy-hd list              các job + trạng thái
@@ -476,7 +479,14 @@ cmd_resume() {
 # ~/.gemini/antigravity-cli/log/cli-*.log ghi RESOURCE_EXHAUSTED (code 429)); agy đứng im ở idle/done mà việc chưa xong
 # (gặp 2026-10-05 trên cả 4 agent chấm điểm). Người dùng: tắt session agy đó đi rồi mở lại là chạy được.
 # Chỉ xét ~12 dòng cuối đang hiện: thông báo cũ trôi lên khi agy chạy tiếp sau restart.
-quota_hit() { screen "$1" visible 40 | grep -v '^[[:space:]]*$' | tail -12 | grep -q -E 'Individual quota reached|RESOURCE_EXHAUSTED|[Qq]uota (reached|exceeded)'; }
+# AGY_HD_FAKE_QUOTA=<file>: chỉ để test (selftest-hd.sh quota): job nào có id trong file thì coi như đang hết hạn mức.
+quota_hit() {
+  [[ -n ${AGY_HD_FAKE_QUOTA:-} && -f $AGY_HD_FAKE_QUOTA ]] && grep -qxF "$1" "$AGY_HD_FAKE_QUOTA" && return 0
+  screen "$1" visible 40 | grep -v '^[[:space:]]*$' | tail -12 | grep -q -E 'Individual quota reached|RESOURCE_EXHAUSTED|[Qq]uota (reached|exceeded)'
+}
+QUOTA_MAX="${AGY_QUOTA_MAX:-5}"          # tick tự restart job hết hạn mức tối đa ngần này lần, rồi QUOTA_GAVE_UP
+QUOTA_RESET_SEC="${AGY_QUOTA_RESET_SEC:-600}"  # job chạy lại được ngần này giây không dính quota thì đặt lại bộ đếm restart
+ev() { echo "$(date '+%F %T') $1 ${*:2}" >>"$JOBS/events.log"; }   # một dòng events.log: "<ngày giờ> <job> <nội dung>"
 cmd_restart() {
   local jd id i msg lr0; jd=$(resolve "${1:?job}"); shift; id=$(basename "$jd"); use_session "$jd"; need
   # Đang có restart khác chạy cho job này (RESTARTING = pid còn sống), hoặc có restart bắt đầu trong lúc chờ khoá: bỏ qua
@@ -501,7 +511,7 @@ cmd_restart() {
     if np=$(pick_profile "${ex[@]}" 2>/dev/null); then
       echo "đổi account: $(acct_of "$jd") → $np ($("$AGYP" email "$np"))"
       setmeta "$jd" PROFILE "$np"; setmeta "$jd" PROFILE_EMAIL "$("$AGYP" email "$np")"
-    else echo "không còn account nào khác có quota: mở lại trên $(acct_of "$jd")"; fi
+    else echo "QUOTA_NO_ACCOUNT: không còn account nào khác có quota: mở lại trên $(acct_of "$jd")"; fi
     flock -u 8
   fi
   cmd_resume "$id" || return 1
@@ -569,7 +579,7 @@ cmd_accounts() {  # bảng account + quota + job đang mở
 # Ghi $JOBS/STATUS.tsv (bảng hiện tại) và nối mỗi lần đổi trạng thái vào $JOBS/events.log. Bỏ qua job đã đóng
 # (close/wt-merge/wt-drop/gc) và job bắt đầu quá 24 giờ trước.
 cmd_tick() {
-  local show=0; [[ ${1:-} == --show ]] && show=1
+  local show=0 brief=0; case ${1:-} in --show) show=1;; --brief) brief=1;; esac
   exec 9>"$JOBS/.tick.lock"; flock -w 50 9 || die "tick khác đang chạy"
   local now jd id st t age steps bc cage cmd v prev started tmp rs lr
   now=$(date +%s); tmp="$JOBS/.status.$$"
@@ -603,14 +613,25 @@ cmd_tick() {
       if ( job_trylock "$jd" && close_ui "$jd" ) >/dev/null 2>&1; then
         echo "$(date '+%F %T') $id DONE quá ${AUTOCLOSE_MIN} phút: đã đóng tab" >>"$JOBS/events.log"; continue; fi
     fi
+    if [[ $v == RUNNING || $v == DONE ]]; then   # chạy (hoặc xong) được đủ lâu sau restart: lần hết hạn mức đó đã qua, đặt lại bộ đếm
+      rs=$(meta "$jd" RESTARTS); lr=$(meta "$jd" LAST_RESTART)
+      if [[ -n $rs && $rs != 0 && -n $lr ]] && (( now - lr >= QUOTA_RESET_SEC )); then
+        setmeta "$jd" RESTARTS 0; setmeta "$jd" QUOTA_GAVE_UP ""; ev "$id quota đã qua (không QUOTA ${QUOTA_RESET_SEC}s sau restart): đặt lại bộ đếm restart (đã dùng $rs)"
+      fi
+    fi
     if [[ $v == QUOTA ]]; then
       rs=$(meta "$jd" RESTARTS); rs=${rs:-0}; lr=$(meta "$jd" LAST_RESTART); lr=${lr:-0}
-      local gap=180; have_profiles && [[ -n $(meta "$jd" PROFILE) ]] && gap=60   # có account khác để chuyển: restart sớm
-      if (( rs < 5 && now - lr >= gap )); then
-        ( job_trylock "$jd" || exit 75; echo "$(date '+%F %T') $id auto-restart #$((rs+1)) (quota)"; cmd_restart "$id" ) >>"$JOBS/events.log" 2>&1
-        [[ $? == 75 ]] && echo "$(date '+%F %T') $id QUOTA nhưng đang có lệnh khác xử lý job: để vòng sau" >>"$JOBS/events.log"
-      elif (( rs >= 5 )); then
-        [[ $(meta "$jd" QUOTA_GAVE_UP) == 1 ]] || { setmeta "$jd" QUOTA_GAVE_UP 1; echo "$(date '+%F %T') $id QUOTA: đã restart 5 lần, dừng tự restart (báo người dùng)" >>"$JOBS/events.log"; }
+      local gap=180 out rc l; have_profiles && [[ -n $(meta "$jd" PROFILE) ]] && gap=60   # có account khác để chuyển: restart sớm
+      gap=${AGY_QUOTA_GAP:-$gap}
+      if (( rs < QUOTA_MAX && now - lr >= gap )); then
+        out=$( ( job_trylock "$jd" || exit 75; echo "auto-restart #$((rs+1))/$QUOTA_MAX (quota)"; cmd_restart "$id" ) 2>&1 ); rc=$?
+        if (( rc == 75 )); then ev "$id QUOTA nhưng đang có lệnh khác xử lý job: để vòng sau"
+        else
+          while IFS= read -r l; do [[ -n $l ]] && ev "$id $l"; done <<<"$out"   # mỗi dòng mang id job: agy-hd notify lọc theo id
+          (( rc )) && ev "$id RESTART_FAILED (exit $rc): restart không xong, xem agy-hd status $id"
+        fi
+      elif (( rs >= QUOTA_MAX )); then
+        [[ $(meta "$jd" QUOTA_GAVE_UP) == 1 ]] || { setmeta "$jd" QUOTA_GAVE_UP 1; ev "$id QUOTA_GAVE_UP: đã restart $rs lần mà vẫn hết hạn mức, dừng tự restart (báo người dùng)"; }
       fi
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$v" "$(fmt_hms "$(meta "$jd" TICK_SINCE)")" "$steps" "$age" \
@@ -618,6 +639,10 @@ cmd_tick() {
   done
   mv "$tmp" "$JOBS/STATUS.tsv"; printf '%s\n' "$(date '+%F %T')" >"$JOBS/STATUS.updated"
   (( show )) && { column -t -s$'\t' "$JOBS/STATUS.tsv"; echo "--- 8 sự kiện cuối ($JOBS/events.log):"; tail -8 "$JOBS/events.log" 2>/dev/null; }
+  # --brief: ít chữ nhất cho lượt dự phòng của phiên Claude (mỗi chữ in ra là token): job không RUNNING thì một dòng mỗi
+  # job, rồi một dòng tổng. Không có việc gì đáng chú ý thì chỉ một dòng "OK ...".
+  (( brief )) && awk -F'\t' 'NR>1 { c[$2]++; if ($2 != "RUNNING") { bad++; printf "%s %s since %s restarts=%s\n", $1, $2, $3, $6 } }
+    END { if (NR <= 1) { print "OK 0 job"; exit } s = ""; for (k in c) s = s (s ? ", " : "") c[k] " " k; print (bad ? "ACTION " : "OK ") s }' "$JOBS/STATUS.tsv"
   return 0
 }
 cmd_close() {
@@ -814,9 +839,78 @@ cmd_watch() {
   done
 }
 
+# notify: lớp báo CHÍNH cho phiên Claude. Ý tưởng: tick (systemd timer, mỗi phút) đã canh sẵn và ghi events.log, nên phiên
+# Claude không cần tự poll (mỗi lượt poll là một lượt LLM đọc lại cả context). notify chỉ in một dòng khi có việc CẦN
+# người xử lý, và im lặng suốt thời gian còn lại; chạy bằng tool Monitor (hoặc Bash run_in_background kèm -1).
+#   DONE | STOPPED | STALL | BLOCKED   job đổi sang trạng thái đó
+#   QUOTA_NO_ACCOUNT                   hết hạn mức mà không còn account khác để chuyển (tick vẫn mở lại trên account cũ)
+#   QUOTA_GAVE_UP                      đã restart tối đa AGY_QUOTA_MAX lần mà vẫn hết hạn mức (tick dừng) -> báo người dùng
+#   RESTART_FAILED                     tick restart job hết hạn mức mà không xong
+# KHÔNG in: RUNNING, QUOTA (tick tự restart), auto-restart, đổi account, đã đóng tab. Trạng thái đã có sẵn lúc bắt đầu
+# cũng được in một lần (không lỡ sự kiện xảy ra trước khi notify chạy). Nếu STATUS.updated cũ hơn 150 s (timer chết)
+# thì notify tự chạy tick và cảnh báo NOTIFY_WARN một lần. Thoát 0 khi mọi job DONE (NOTIFY=ALL_DONE), 5 khi quá -t.
+cmd_notify() {
+  local tmo=21600 once=0 o; OPTIND=1
+  while getopts "t:1" o; do case $o in t) tmo=$OPTARG;; 1) once=1;; *) exit 2;; esac; done; shift $((OPTIND-1))
+  (( $# )) || die "notify: cần ít nhất một job"
+  local -A want=() fin=() seen=(); local k jd id s l d t rest kind hint warned=0 n=0 rc upd
+  for k in "$@"; do jd=$(resolve "$k"); want[$(basename "$jd")]=$jd; done
+  local deadline=$(( $(date +%s) + tmo )); touch "$JOBS/events.log"
+  exec 3< <(exec tail -Fn0 "$JOBS/events.log" 2>/dev/null); local tp=$!
+  trap "kill $tp 2>/dev/null" EXIT   # nở $tp ngay: local biến mất khi hàm return, mà set -u
+  emit() {  # $1=id $2=loại sự kiện
+    case $2 in
+      DONE) hint="xong: kiểm chứng (agy-hd result/wt-diff, chạy lại test) rồi agy-hd close $1";;
+      STOPPED) hint="dừng giữa chừng: agy-hd logs $1 40, rồi agy-hd resume/restart $1";;
+      STALL) hint="treo: agy-hd logs $1 40; treo thật thì agy-hd interrupt $1 rồi agy-hd prompt $1 \"...\"";;
+      BLOCKED) hint="agy đang hỏi/chờ duyệt: báo người dùng (agy-hd access $1 in lệnh attach), đừng trả lời thay";;
+      QUOTA_NO_ACCOUNT) hint="hết hạn mức và không còn account khác: tick vẫn thử lại trên account cũ; báo người dùng (agy-p usage)";;
+      QUOTA_GAVE_UP) hint="hết hạn mức, đã restart tối đa mà vẫn bị chặn: tick đã dừng. Báo người dùng + thời gian 'Resets in' (agy-hd logs $1 20)";;
+      RESTART_FAILED) hint="tick restart không xong: agy-hd status $1, rồi agy-hd close $1 + start lại nếu agy không thoát";;
+    esac
+    echo "NOTIFY $1 $2: $hint"; n=$((n+1))
+  }
+  for id in "${!want[@]}"; do jd=${want[$id]}; s=$(meta "$jd" TICK_STATE)
+    case $s in
+      DONE) fin[$id]=1; emit "$id" DONE;;
+      STOPPED|STALL|BLOCKED) emit "$id" "$s";;
+      QUOTA) [[ $(meta "$jd" QUOTA_GAVE_UP) == 1 ]] && emit "$id" QUOTA_GAVE_UP;;
+    esac
+  done
+  (( ${#fin[@]} == ${#want[@]} )) && { echo "NOTIFY=ALL_DONE"; return 0; }
+  (( once && n )) && return 0
+  while :; do
+    (( $(date +%s) >= deadline )) && { echo "NOTIFY=TIMEOUT (${tmo}s; còn chạy: $(printf '%s ' "${!want[@]}"))"; return 5; }
+    upd="$JOBS/STATUS.updated"
+    if [[ ! -f $upd ]] || (( $(date +%s) - $(file_mtime "$upd") > 150 )); then
+      (( warned )) || { echo "NOTIFY_WARN tick không cập nhật quá 150 s (systemctl --user is-active agy-hd-tick.timer): notify tự chạy tick"; warned=1; }
+      "$SELF" tick >/dev/null 2>&1
+    fi
+    IFS= read -r -t 30 l <&3; rc=$?
+    (( rc > 128 )) && continue   # hết 30 s không có dòng nào: vòng lại kiểm hạn và tick
+    (( rc )) && { echo "NOTIFY=ERROR tail events.log đã thoát"; return 1; }
+    read -r d t id rest <<<"$l"; [[ -n ${want[$id]:-} ]] || continue
+    kind=""
+    case $rest in
+      *"-> DONE"*) kind=DONE; fin[$id]=1;;
+      *"-> RUNNING"*|*"-> QUOTA"*) unset "fin[$id]";;
+      *"-> STOPPED"*) kind=STOPPED;;
+      *"-> STALL"*) kind=STALL;;
+      *"-> BLOCKED"*) kind=BLOCKED;;
+      *QUOTA_GAVE_UP*) kind=QUOTA_GAVE_UP;;
+      *QUOTA_NO_ACCOUNT*) [[ -n ${seen[$id]:-} ]] || { kind=QUOTA_NO_ACCOUNT; seen[$id]=1; };;   # mỗi restart ghi một dòng: báo một lần
+      *RESTART_FAILED*) kind=RESTART_FAILED;;
+      *"đã đóng tab"*) fin[$id]=1;;
+    esac
+    [[ -n $kind ]] && emit "$id" "$kind"
+    (( ${#fin[@]} == ${#want[@]} )) && { echo "NOTIFY=ALL_DONE"; return 0; }
+    [[ -n $kind ]] && (( once )) && return 0
+  done
+}
+
 sub=${1:-}; shift || true
 case $sub in
-  start) cmd_start "$@";; prompt) cmd_prompt "$@";; status) cmd_status "$@";; wait) cmd_wait "$@";; watch) cmd_watch "$@";; restart) cmd_restart "$@";; switch) cmd_switch "$@";; accounts) cmd_accounts "$@";; tick) cmd_tick "$@";;
+  start) cmd_start "$@";; prompt) cmd_prompt "$@";; status) cmd_status "$@";; wait) cmd_wait "$@";; watch) cmd_watch "$@";; notify) cmd_notify "$@";; restart) cmd_restart "$@";; switch) cmd_switch "$@";; accounts) cmd_accounts "$@";; tick) cmd_tick "$@";;
   logs) cmd_logs "$@";; result) cmd_result "$@";; summary) cmd_summary "$@";; access) cmd_access "$@";;
   interrupt) cmd_interrupt "$@";; resume) cmd_resume "$@";; close) cmd_close "$@";; list) cmd_list "$@";;
   wt-diff|wt-merge|wt-drop) cmd_wt "$sub" "$@";; gc) cmd_gc "$@";; fan) cmd_fan "$@";;

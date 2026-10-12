@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Test tự động cho agy-hd. Gọi agy thật (~5 phút). Dựng session herdr RIÊNG (headless) + repo tạm +
 # registry riêng; KHÔNG đụng session default hay job thật. Tự dừng/xóa session và dọn khi xong.
-# Usage: selftest-hd.sh [ro followup carry conflict interrupt fan gc ...]
+# Usage: selftest-hd.sh [ro followup carry conflict interrupt fan quota gc ...]
 set -uo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd); HD=$here/agy-hd.sh
 T=$(mktemp -d "${TMPDIR:-/tmp}/agyhd-selftest.XXXXXX"); SESS="agyhdtest$$"
@@ -101,6 +101,72 @@ if run gc; then echo "== gc"
   check "gc 0 không -y: chỉ liệt kê"  "$HD gc 0 >/dev/null 2>&1; [[ \$(ls '$AGY_HD_JOBS' | wc -l) -eq $n ]]"
   $HD gc 0 -y >/dev/null 2>&1
   check "gc 0 -y: xóa job xong"       "[[ \$(ls '$AGY_HD_JOBS' | wc -l) -lt $n || $n -eq 0 ]]"
+fi
+
+if run quota; then echo "== quota: tick tự restart + đổi account; bị chặn (hết mọi account) -> NO_ACCOUNT, GAVE_UP; notify; đặt lại bộ đếm"
+  # Hết hạn mức giả lập bằng AGY_HD_FAKE_QUOTA (file chứa id job): màn hình agy thật không đổi, nhưng quota_hit báo true.
+  # Mọi thứ khác là thật: agy thật, herdr thật, agy-p pick thật, restart/resume thật.
+  export AGY_HD_FAKE_QUOTA=$T/fakequota AGY_QUOTA_GAP=2 AGY_QUOTA_MAX=2 AGY_QUOTA_RESET_SEC=5
+  : >"$AGY_HD_FAKE_QUOTA"; mkrepo
+  st_of() { awk -F'\t' -v j="$1" '$1==j{print $2}' "$AGY_HD_JOBS/STATUS.tsv"; }
+  until_state() {  # $1=job $2=regex trạng thái $3=số giây; tick mỗi 4 s
+    local e=$(( $(date +%s) + $3 )); while (( $(date +%s) < e )); do $HD tick >/dev/null 2>&1; [[ $(st_of "$1") =~ $2 ]] && return 0; sleep 4; done; return 1; }
+
+  # --- A: còn account khác -> restart chuyển account, cùng conversation, làm tiếp
+  out=$($HD start -A -n qa -d "$T/repo" -p "Tạo file qa.txt chứa đúng chữ ok. Xong thì trả lời 1 dòng." 2>&1)
+  ida=$(grep -o 'a-qa-[0-9a-f]*' <<<"$out" | head -1); jda=$AGY_HD_JOBS/$ida
+  check "A: start có job + account"   "[[ -n '$ida' ]] && grep -q '^PROFILE=' '$jda/meta.env'"
+  until_state "$ida" '^DONE$' 240; check "A: job chạy tới DONE" "[[ \$(st_of '$ida') == DONE ]]"
+  $HD notify "$ida" >"$T/nA.out" 2>&1 & npa=$!
+  sleep 1; check "A: notify in ngay DONE đã có sẵn (level-triggered)" "grep -q 'NOTIFY $ida DONE' '$T/nA.out'"
+  kill $npa 2>/dev/null; wait $npa 2>/dev/null
+  profA0=$(sed -n 's/^PROFILE=//p' "$jda/meta.env"); trA0=$(sed -n 's/^TRANSCRIPT=//p' "$jda/meta.env"); nl0=$(wc -l <"$trA0")
+  $HD notify "$ida" >"$T/nA2.out" 2>&1 & npa=$!   # notify mới, nghe tiếp sự kiện
+  echo "$ida" >>"$AGY_HD_FAKE_QUOTA"
+  $HD tick >/dev/null 2>&1   # thấy QUOTA -> restart đồng bộ
+  echo -n >"$AGY_HD_FAKE_QUOTA"   # restart xong: hết hạn mức (giả lập) hết
+  check "A: events.log có auto-restart #1" "grep -q '$ida auto-restart #1/2' '$AGY_HD_JOBS/events.log'"
+  check "A: events.log ghi đổi account"    "grep -q \"$ida đổi account\" '$AGY_HD_JOBS/events.log'"
+  profA1=$(sed -n 's/^PROFILE=//p' "$jda/meta.env")
+  check "A: account đổi ($profA0 -> $profA1)" "[[ -n '$profA1' && '$profA1' != '$profA0' ]]"
+  until_state "$ida" '^DONE$' 240; check "A: sau restart job DONE lại" "[[ \$(st_of '$ida') == DONE ]]"
+  check "A: cùng transcript/conversation, thêm bước" "[[ \$(sed -n 's/^TRANSCRIPT=//p' '$jda/meta.env') == '$trA0' && \$(wc -l <'$trA0') -gt $nl0 ]]"
+  sleep 3; kill $npa 2>/dev/null; wait $npa 2>/dev/null
+  check "A: notify không in QUOTA/restart/RUNNING" "! grep -qE 'auto-restart|QUOTA|RUNNING|đổi account' '$T/nA2.out'"
+  check "A: notify báo DONE sau restart"           "grep -q 'NOTIFY $ida DONE' '$T/nA2.out'"
+  $HD close "$ida" >/dev/null 2>&1
+
+  # --- B: bị chặn - mọi account hết (agy-p pick giả không còn account) -> NO_ACCOUNT, restart tối đa 2, GAVE_UP
+  mkdir -p "$T/bin"; real=$(command -v agy-p)
+  printf '#!/usr/bin/env bash\n[[ ${1:-} == pick && -f "%s/nopick" ]] && { echo "không còn account" >&2; exit 1; }\nexec "%s" "$@"\n' "$T" "$real" >"$T/bin/agy-p"; chmod +x "$T/bin/agy-p"
+  touch "$T/nopick"; export PATH="$T/bin:$PATH"
+  out=$($HD start -A -n qb -d "$T/repo" -p "Tạo file qb.txt chứa đúng chữ ok. Xong thì trả lời 1 dòng." 2>&1)
+  idb=$(grep -o 'a-qb-[0-9a-f]*' <<<"$out" | head -1); jdb=$AGY_HD_JOBS/$idb
+  check "B: start có job"             "[[ -n '$idb' ]]"
+  until_state "$idb" '^DONE$' 240
+  # job giả luôn RUNNING giữ notify sống (notify thoát khi MỌI job DONE; idb đã DONE ở đây)
+  mkdir -p "$AGY_HD_JOBS/a-dummy-0000"; printf 'WORKDIR=%s\nTICK_STATE=RUNNING\nCLOSED=1\n' "$T" >"$AGY_HD_JOBS/a-dummy-0000/meta.env"
+  $HD notify "$idb" a-dummy-0000 >"$T/nB.out" 2>&1 & npb=$!
+  sleep 1; echo "$idb" >"$AGY_HD_FAKE_QUOTA"   # notify đã nghe; từ đây là sự kiện mới
+  for _ in 1 2 3 4 5 6; do $HD tick >/dev/null 2>&1; [[ $(sed -n 's/^QUOTA_GAVE_UP=//p' "$jdb/meta.env") == 1 ]] && break; sleep 3; done
+  rsB=$(sed -n 's/^RESTARTS=//p' "$jdb/meta.env")
+  check "B: restart đúng 2 lần rồi dừng"       "[[ '$rsB' == 2 ]]"
+  check "B: QUOTA_NO_ACCOUNT trong events.log" "grep -q '$idb QUOTA_NO_ACCOUNT' '$AGY_HD_JOBS/events.log'"
+  check "B: QUOTA_GAVE_UP trong events.log"    "[[ \$(grep -c '$idb QUOTA_GAVE_UP' '$AGY_HD_JOBS/events.log') -eq 1 ]]"
+  $HD tick >/dev/null 2>&1; $HD tick >/dev/null 2>&1
+  check "B: gave up xong tick không restart nữa" "[[ \$(sed -n 's/^RESTARTS=//p' '$jdb/meta.env') == 2 && \$(grep -c '$idb auto-restart' '$AGY_HD_JOBS/events.log') -eq 2 ]]"
+  check "B: STATUS vẫn QUOTA (không giả vờ RUNNING)" "[[ \$(st_of '$idb') == QUOTA ]]"
+  sleep 3; kill $npb 2>/dev/null; wait $npb 2>/dev/null
+  check "B: notify báo NO_ACCOUNT"     "grep -q 'NOTIFY $idb QUOTA_NO_ACCOUNT' '$T/nB.out'"
+  check "B: notify báo GAVE_UP"        "grep -q 'NOTIFY $idb QUOTA_GAVE_UP' '$T/nB.out'"
+  check "B: notify đúng 3 dòng (DONE có sẵn + NO_ACCOUNT + GAVE_UP; không RUNNING/QUOTA/auto-restart)" "[[ \$(grep -c '^NOTIFY ' '$T/nB.out') -eq 3 && \$(grep -c -E 'RUNNING|auto-restart' '$T/nB.out') -eq 0 ]]"
+  # --- C: hết hạn mức qua đi -> job chạy lại được, bộ đếm đặt lại (không dùng cạn 5 lần của cả đời job)
+  echo -n >"$AGY_HD_FAKE_QUOTA"; rm -f "$T/nopick"
+  until_state "$idb" '^(RUNNING|DONE)$' 120; sleep 6; $HD tick >/dev/null 2>&1
+  check "C: bộ đếm về 0 và QUOTA_GAVE_UP xoá"  "[[ \$(sed -n 's/^RESTARTS=//p' '$jdb/meta.env') == 0 && -z \$(sed -n 's/^QUOTA_GAVE_UP=//p' '$jdb/meta.env') ]]"
+  check "C: có dòng đặt lại trong events.log"  "grep -q '$idb quota đã qua' '$AGY_HD_JOBS/events.log'"
+  $HD close "$idb" >/dev/null 2>&1
+  unset AGY_HD_FAKE_QUOTA AGY_QUOTA_GAP AGY_QUOTA_MAX AGY_QUOTA_RESET_SEC
 fi
 
 echo; echo "PASS=$pass FAIL=$fail"; [[ $fail -eq 0 ]]
