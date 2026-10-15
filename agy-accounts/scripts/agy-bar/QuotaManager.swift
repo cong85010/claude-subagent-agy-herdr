@@ -312,6 +312,15 @@ public class QuotaManager {
     }
     
     public func openDashboard() {
+        let dashboardPath = (rootDir as NSString).appendingPathComponent("dashboard.html")
+        let url = URL(fileURLWithPath: dashboardPath)
+        
+        if FileManager.default.fileExists(atPath: dashboardPath) {
+            DispatchQueue.main.async {
+                NSWorkspace.shared.open(url)
+            }
+        }
+        
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             let proc = Process()
@@ -320,8 +329,15 @@ public class QuotaManager {
             let home = NSHomeDirectory()
             env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
             proc.environment = env
-            proc.arguments = ["-l", "-c", "\(self.agyPPath) dash"]
+            proc.arguments = ["-l", "-c", "\(self.agyPPath) dash --no-open"]
             try? proc.run()
+            proc.waitUntilExit()
+            
+            if !FileManager.default.fileExists(atPath: dashboardPath) {
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.open(url)
+                }
+            }
         }
     }
     

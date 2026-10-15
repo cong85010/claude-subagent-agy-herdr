@@ -379,7 +379,7 @@ if frag: open(frag, "w", encoding="utf-8").write(page)
 open(out, "w", encoding="utf-8").write('<!doctype html>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n' + page)
 EOF
   echo "Dashboard: $out"
-  (( open )) && { xdg-open "$out" >/dev/null 2>&1 & disown 2>/dev/null; } || true
+  (( open )) && { { xdg-open "$out" 2>/dev/null || open "$out" 2>/dev/null; } & disown 2>/dev/null; } || true
 }
 
 keyring_email() {  # account mà `agy` trần dùng ở terminal không có biến SSH (gnome-keyring / Apple Keychain)
